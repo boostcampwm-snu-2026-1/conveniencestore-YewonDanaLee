@@ -14,12 +14,17 @@ Styling   : Tailwind CSS
 데이터 패칭 : TanStack Query (React Query)
 차트/UI    : 없음 (순수 Tailwind 컴포넌트)
 배포       : Vercel
+
+Backend   : Python 3 (독립 실행, 프론트엔드와 분리)
+크롤링     : Selenium + webdriver-manager
+스케줄러   : APScheduler (BlockingScheduler + CronTrigger)
+DB        : (프로젝트에 맞게 선택 — 예: PostgreSQL / SQLite)
 ```
 
 ## 3. 디렉토리 구조
 
 ```
-src/
+src/                              # 프론트엔드 (Next.js)
 ├── app/
 │   ├── page.tsx                  # 메인 (검색창 + 마감임박)
 │   ├── search/
@@ -43,6 +48,20 @@ src/
 │   └── utils.ts                  # 가격 포맷, 남은 시간 계산 등
 └── types/
     └── index.ts                  # Product, Deal, Category 타입 정의
+
+backend/                          # 백엔드 (독립 Python 프로세스)
+├── crawlers/
+│   ├── __init__.py               # 3사 크롤러 일괄 실행 진입점 (run_all())
+│   ├── gs25_crawling.py          # GS25 행사 상품 크롤러
+│   ├── cu_crawling.py            # CU 행사 상품 크롤러
+│   └── seven-eleven_crawling.py  # 세븐일레븐 행사 상품 크롤러
+├── db/
+│   └── client.py                 # DB 클라이언트 초기화 및 export
+├── scheduler/
+│   └── monthly.py                # 매월 1일 자정 APScheduler 스케줄러
+├── scripts/
+│   └── crawl.py                  # 수동 즉시 실행 스크립트 (python3 scripts/crawl.py)
+└── index.py                      # 서버 진입점 (스케줄러 등록 + 프로세스 유지)
 ```
 
 ## 4. 라우팅 규칙
@@ -231,4 +250,100 @@ formatExpiry(expires_at: string): string
 ✅ 행사 없는 편의점 열도 DealComparison에 유지 (숨기지 말 것)
 ✅ 신규 컴포넌트 추가 시 components/ 아래에 위치
 ✅ API 호출은 반드시 lib/api.ts 함수를 통해서만
+```
+
+---
+
+## 14. 백엔드 구조 규칙
+
+- `backend/`는 프론트엔드(`src/`)와 완전히 분리된 독립 Python 프로세스다.
+- 크롤러 로직은 반드시 `backend/crawlers/` 안에 편의점별 파일로 분리한다 (`gs25_crawling.py`, `cu_crawling.py`, `seven-eleven_crawling.py`).
+- 각 크롤러 파일은 `main()` 함수를 공개 인터페이스로 사용하고, 반환 타입은 `list[Product]`로 통일한다.
+- DB 접근은 반드시 `backend/db/client.py`를 통해서만 한다. 크롤러 파일에서 직접 DB를 연결하지 않는다.
+- 수동 실행이 필요할 때는 `backend/scripts/crawl.py`를 사용한다 (스케줄러 우회).
+
+## 15. 크롤링 스케줄러 규칙
+
+### 스케줄 — 매월 1일 자정
+```
+cron 표현식: 0 0 1 * *
+의미: 매월 1일 00:00 (서버 로컬 시간 기준)
+파일: backend/scheduler/monthly.ts
+```
+
+### 기본 구조
+```python
+# backend/scheduler/monthly.py
+from apscheduler.schedulers.blocking import BlockingScheduler
+from apscheduler.triggers.cron import CronTrigger
+from crawlers import run_all
+
+def crawl_job():
+    print("[Scheduler] 월간 크롤링 시작")
+    run_all()
+    print("[Scheduler] 월간 크롤링 완료")
+
+def start():
+    scheduler = BlockingScheduler(timezone="Asia/Seoul")
+    scheduler.add_job(crawl_job, CronTrigger(day=1, hour=0, minute=0))
+    print("[Scheduler] 등록 완료 — 매월 1일 자정(KST)에 크롤링 실행")
+    scheduler.start()
+```
+
+```python
+# backend/index.py
+from scheduler.monthly import start
+
+if __name__ == "__main__":
+    start()
+```
+
+### 크롤러 진입점 구조
+```python
+# backend/crawlers/__init__.py
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import gs25_crawling, cu_crawling, seven_eleven_crawling
+
+def run_all() -> dict:
+    crawlers = {
+        "GS25": gs25_crawling.main,
+        "CU":   cu_crawling.main,
+        "7EL":  seven_eleven_crawling.main,
+    }
+    results = {}
+    with ThreadPoolExecutor(max_workers=3) as executor:
+        futures = {executor.submit(fn): store for store, fn in crawlers.items()}
+        for future in as_completed(futures):
+            store = futures[future]
+            try:
+                results[store] = future.result()
+            except Exception as e:
+                print(f"[{store}] 실패: {e}")
+                results[store] = []
+    return results
+```
+
+### 크롤링 결과 타입 (각 크롤러 내부 dataclass)
+```python
+# 각 크롤러 파일의 Product dataclass — 편의점마다 필드가 다를 수 있음
+@dataclass
+class Product:
+    event_type: str        # "1+1" / "2+1" / "증정행사" / "할인행사"
+    name: str
+    price: str             # "1,500원" 형태
+    image_url: str
+    # (크롤러에 따라 barcode, product_id, detail_url 등 추가 필드 가능)
+```
+
+### 스케줄러 관련 금지 사항
+```
+❌ 크롤러 파일(gs25_crawling.py 등)에서 직접 DB 연결
+❌ run_all() 외부에서 개별 크롤러를 직접 호출해 DB에 저장
+❌ CronTrigger(day=1, hour=0, minute=0) 외 다른 스케줄로 임의 변경
+❌ 크롤링 실패 시 프로세스 전체를 종료 (ThreadPoolExecutor로 개별 처리)
+```
+
+### 의존성 설치
+```
+pip install selenium webdriver-manager apscheduler
 ```
